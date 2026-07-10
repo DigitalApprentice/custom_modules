@@ -1,0 +1,860 @@
+/*
+ * fft_core0.c — v2  — MicroPython user C module dla ESP32-S3
+ * Zaktualizowane dla ESP-IDF v5.4 i MicroPython v1.28.0
+ *
+ * NOWE w v2:
+ * - Konfigurowalne pasma (3/6/12/24) z logarytmicznym podziałem
+ * - Cechy spektralne: energy, bass, mid, treble, presence,
+ * brilliance, centroid, flux, rolloff, spread, zcr
+ * - Wykrywanie uderzeń (beat detection) + siła + estymacja BPM
+ * - Wszystkie bufory dostępne jako memoryview (zero alokacji)
+ * - Radix-2 FFT, okno Hanna, I2S INMP441
+ */
+
+/* FreeRTOS headers MUST precede MicroPython headers to avoid
+ * implicit-declaration conflicts with xTaskCreatePinnedToCore */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "driver/i2s_std.h"
+#include "esp_log.h"
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+#include "py/runtime.h"
+#include "py/obj.h"
+#include "py/binary.h"
+
+static const char *TAG __attribute__((unused)) = "fft_core1";
+
+/* ================================================================
+ * STAŁE
+ * ================================================================ */
+
+#define FFT_MAX_SIZE     1024
+#define FFT_DEFAULT_SIZE 256
+#define MAX_BANDS        24
+#define BPM_HISTORY      16    // liczba odstępów między beatami do uśredniania
+#define I2S_TIMEOUT_MS   100
+
+/* ================================================================
+ * STRUCT CECH SPEKTRALNYCH
+ * Eksponowany do Pythona przez memoryview jako surowe bajty.
+ * Układ musi być identyczny w C i w Pythonie (struct.unpack).
+ * ================================================================ */
+
+#pragma pack(push, 1)
+typedef struct {
+    // Pasma energetyczne — float32 [0.0–1.0]
+    float energy;          // offset  0: RMS całego sygnału
+    float bass;            // offset  4: 20–300 Hz
+    float mid;             // offset  8: 300–4000 Hz
+    float treble;          // offset 12: 4000–20000 Hz
+    float presence;        // offset 16: 2000–6000 Hz
+    float brilliance;      // offset 20: 6000–20000 Hz
+
+    // Właściwości widma — float32 [0.0–1.0]
+    float centroid;        // offset 24: środek ciężkości widma
+    float flux;            // offset 28: szybkość zmiany widma (transient)
+    float rolloff;         // offset 32: 85%-rolloff (jasność)
+    float spread;          // offset 36: rozpiętość widma
+    float zcr;             // offset 40: zero-crossing rate
+
+    // Rytm — uint8
+    uint8_t beat;          // offset 44: 1 = wykryto uderzenie
+    uint8_t beat_strength; // offset 45: siła uderzenia 0–255
+    uint8_t bpm_est;       // offset 46: estymowane BPM (0=nieznane)
+    uint8_t _pad;          // offset 47: wyrównanie
+
+    // Poziomy gotowe do LED — uint8 [0–255]
+    uint8_t bass_level;    // offset 48
+    uint8_t mid_level;     // offset 49
+    uint8_t treble_level;  // offset 50
+    uint8_t energy_level;  // offset 51
+    uint8_t presence_level;// offset 52
+    uint8_t centroid_level;// offset 53
+    uint8_t flux_level;    // offset 54
+    uint8_t _pad2;         // offset 55
+} fft_features_t;          // sizeof = 56 bajtów
+#pragma pack(pop)
+
+// Python: struct.unpack('<fffffffffffffBBBBBBBBBBBB', features_buf)
+// Offsety uint8 poziomów: 48-54
+
+/* ================================================================
+ * BUFORY STATYCZNE
+ * ================================================================ */
+
+static float    fft_re[FFT_MAX_SIZE];
+static float    fft_im[FFT_MAX_SIZE];
+static float    hann_window[FFT_MAX_SIZE];
+
+// Magnitudy po FFT — uint8 0-255, len = fft_size/2
+static uint8_t  magnitudes[FFT_MAX_SIZE / 2];
+static float    peak_values[FFT_MAX_SIZE / 2];
+static float    prev_magnitudes_f[FFT_MAX_SIZE / 2];  // float dla flux
+
+// Słupki zgrupowane — uint8 0-255, len = num_bands
+static uint8_t  band_values[MAX_BANDS];
+
+// Cechy spektralne
+static fft_features_t features;
+
+// I2S raw (int32 STEREO buffer — INMP441 needs 32-bit slots)
+static int32_t  i2s_raw[FFT_MAX_SIZE * 2];
+
+// BPM estimation
+static uint32_t beat_times[BPM_HISTORY];  // tick ms kolejnych beatów
+static int      beat_idx    = 0;
+static int      beat_count  = 0;
+
+/* ================================================================
+ * STAN GLOBALNY
+ * ================================================================ */
+
+static volatile int   fft_size       = FFT_DEFAULT_SIZE;
+static volatile int   num_bands      = 12;
+static volatile int   fft_ready      = 0;
+
+static volatile float peak_decay       = 0.92f;
+static volatile float global_max       = 0.0f;
+static volatile float global_max_dec   = 0.99f;   // Szybszy spadek (0.99) dla lepszej dynamiki
+static volatile float global_max_floor = 0.001f;   // Floor for AGC — matched to INMP441 output level
+static volatile float noise_gate       = 0.001f;   // INMP441 max_mag_raw ~0.003 with loud music
+static float          raw_max          = 0.0f;   // max surowych mag przed peak_decay
+static int            warmup_frames    = 0;       // pierwsze 4 ramki: pomiń flux
+
+// Diagnostics — exposed via info()
+static volatile float diag_max_mag_raw   = 0.0f;  // max FFT magnitude BEFORE noise gate
+static volatile int   diag_bins_above    = 0;     // bins that passed noise gate
+static volatile int   diag_max_sample    = 0;     // max |sample| seen (int16)
+static volatile float diag_noise_gate_val= 0.0f;  // current noise_gate for reference
+
+static volatile float beat_threshold = 0.25f;  // próg flux dla beat
+static volatile int   sample_rate    = 44100;
+
+static i2s_chan_handle_t rx_chan    = NULL;
+static TaskHandle_t      fft_task_h = NULL;
+static SemaphoreHandle_t cfg_mutex  = NULL;
+static volatile bool     fft_task_running = false;
+
+/* ================================================================
+ * OKNO HANNA
+ * ================================================================ */
+
+static void hann_init(int n) {
+    for (int i = 0; i < n; i++) {
+        hann_window[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (n - 1)));
+    }
+}
+
+/* ================================================================
+ * RADIX-2 FFT COOLEY-TUKEY
+ * ================================================================ */
+
+static void fft_compute(int n) {
+    int j = 0;
+    for (int i = 1; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            float t;
+            t = fft_re[i]; fft_re[i] = fft_re[j]; fft_re[j] = t;
+            t = fft_im[i]; fft_im[i] = fft_im[j]; fft_im[j] = t;
+        }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        float ang     = -2.0f * M_PI / len;
+        float base_re = cosf(ang), base_im = sinf(ang);
+        for (int i = 0; i < n; i += len) {
+            float w_re = 1.0f, w_im = 0.0f;
+            for (int k = 0; k < (len >> 1); k++) {
+                int p = i + k, q = i + k + (len >> 1);
+                float u_re = fft_re[p], u_im = fft_im[p];
+                float v_re = fft_re[q]*w_re - fft_im[q]*w_im;
+                float v_im = fft_re[q]*w_im + fft_im[q]*w_re;
+                fft_re[p] = u_re + v_re; fft_im[p] = u_im + v_im;
+                fft_re[q] = u_re - v_re; fft_im[q] = u_im - v_im;
+                float nw = w_re*base_re - w_im*base_im;
+                w_im = w_re*base_im + w_im*base_re;
+                w_re = nw;
+            }
+        }
+    }
+}
+
+/* ================================================================
+ * OBLICZANIE PASM (logarytmiczne)
+ * ================================================================ */
+
+static void compute_bands(int n, int sr) {
+    int   bins       = n >> 1;
+    float hz_per_bin = (float)sr / n;
+    float f_min      = hz_per_bin * 1.0f;          // pomiń DC
+    float f_max      = (float)sr * 0.5f;
+    float log_ratio  = logf(f_max / f_min);
+    int   nb         = num_bands;
+
+    for (int b = 0; b < nb; b++) {
+        float f_start = f_min * expf(log_ratio * (float)b       / nb);
+        float f_end   = f_min * expf(log_ratio * (float)(b + 1) / nb);
+
+        int bin_s = (int)(f_start / hz_per_bin);
+        int bin_e = (int)(f_end   / hz_per_bin);
+        if (bin_s >= bins) bin_s = bins - 1;
+        if (bin_e >= bins) bin_e = bins - 1;
+        if (bin_s > bin_e) bin_s = bin_e;
+
+        uint8_t mx = 0;
+        for (int i = bin_s; i <= bin_e; i++) {
+            if (magnitudes[i] > mx) mx = magnitudes[i];
+        }
+        band_values[b] = mx;
+    }
+    // Zeruj nieużywane
+    for (int b = nb; b < MAX_BANDS; b++) band_values[b] = 0;
+}
+
+/* ================================================================
+ * WYKRYWANIE UDERZEŃ — BPM
+ * ================================================================ */
+
+static void update_bpm(uint32_t now_ms) {
+    beat_times[beat_idx % BPM_HISTORY] = now_ms;
+    beat_idx++;
+    beat_count++;
+
+    if (beat_count < 4) {
+        features.bpm_est = 0;
+        return;
+    }
+
+    // Uśrednij ostatnie odstępy
+    int valid = (beat_count < BPM_HISTORY) ? beat_count : BPM_HISTORY;
+    float sum_interval = 0;
+    int   count        = 0;
+
+    for (int i = 1; i < valid; i++) {
+        int idx_new = (beat_idx - 1 - (i-1) + BPM_HISTORY) % BPM_HISTORY;
+        int idx_old = (beat_idx - 1 - i    + BPM_HISTORY) % BPM_HISTORY;
+        uint32_t dt = beat_times[idx_new] - beat_times[idx_old];
+        if (dt > 250 && dt < 2000) {  // 30–240 BPM
+            sum_interval += dt;
+            count++;
+        }
+    }
+
+    if (count > 0) {
+        float avg_ms = sum_interval / count;
+        float bpm    = 60000.0f / avg_ms;
+        if (bpm > 30 && bpm < 240) {
+            features.bpm_est = (uint8_t)bpm;
+        }
+    }
+}
+
+/* ================================================================
+ * OBLICZANIE CECH SPEKTRALNYCH
+ * ================================================================ */
+
+static void compute_features(int n, int sr) {
+    int   bins       = n >> 1;
+    float hz_per_bin = (float)sr / n;
+
+    // Granice pasm (w binach)
+    int b_bass_end    = (int)(300.0f  / hz_per_bin);
+    int b_mid_end     = (int)(4000.0f / hz_per_bin);
+    int b_pres_start  = (int)(2000.0f / hz_per_bin);
+    int b_pres_end    = (int)(6000.0f / hz_per_bin);
+    int b_brill_start = (int)(6000.0f / hz_per_bin);
+
+    if (b_bass_end  >= bins) b_bass_end  = bins - 1;
+    if (b_mid_end   >= bins) b_mid_end   = bins - 1;
+    if (b_pres_end  >= bins) b_pres_end  = bins - 1;
+    if (b_brill_start >= bins) b_brill_start = bins - 1;
+
+    // ---- Akumulatory ----
+    float energy_sum  = 0;
+    float bass_sum    = 0,  mid_sum   = 0, treble_sum = 0;
+    float pres_sum    = 0,  brill_sum = 0;
+    float cent_num    = 0,  cent_den  = 0;
+    float flux_sum    = 0;
+
+    // Zero-crossing rate — same channel as FFT input: LEFT (i2s_raw[i*2])
+    int zcr_count = 0;
+    for (int i = 1; i < n; i++) {
+        int16_t a = (int16_t)(i2s_raw[(i-1)*2] >> 16);
+        int16_t b = (int16_t)(i2s_raw[i*2]     >> 16);
+        if ((a >= 0 && b < 0) || (a < 0 && b >= 0)) zcr_count++;
+    }
+    features.zcr = (float)zcr_count / n;
+
+    // Analiza widma — używamy peak_values (float) dla zachowania dynamiki energii
+    float total_energy = 0;
+    // float noise_gate = 0.5f; // USUNIĘTO: Shadowing globalnej zmiennej
+
+    for (int i = 1; i < bins; i++) {
+        float m = peak_values[i]; 
+        if (m < noise_gate) m = 0;
+        
+        float f = i * hz_per_bin;
+        float m2 = m * m;
+
+        energy_sum  += m2;
+        cent_num    += f * m;
+        cent_den    += m;
+        total_energy+= m;
+
+        if (i <= b_bass_end)     bass_sum  += m;
+        else if (i <= b_mid_end) mid_sum   += m;
+        else                     treble_sum += m;
+
+        if (i >= b_pres_start  && i <= b_pres_end)  pres_sum  += m;
+        if (i >= b_brill_start)                      brill_sum += m;
+
+        // Spektralny flux (tylko pozytywna zmiana)
+        if (warmup_frames > 0) {
+            float diff = m - prev_magnitudes_f[i];
+            if (diff > 0) flux_sum += diff;
+        }
+        prev_magnitudes_f[i] = m;
+    }
+
+    // Normalizacja
+    int bass_bins   = b_bass_end + 1;
+    int mid_bins    = b_mid_end - b_bass_end;
+    int treble_bins = bins - b_mid_end;
+    int pres_bins   = b_pres_end - b_pres_start + 1;
+    int brill_bins  = bins - b_brill_start;
+
+    features.energy    = sqrtf(energy_sum / bins);
+    features.bass      = (bass_bins   > 0) ? bass_sum   / bass_bins   : 0;
+    features.mid       = (mid_bins    > 0) ? mid_sum    / mid_bins    : 0;
+    features.treble    = (treble_bins > 0) ? treble_sum / treble_bins : 0;
+    features.presence  = (pres_bins   > 0) ? pres_sum   / pres_bins   : 0;
+    features.brilliance= (brill_bins  > 0) ? brill_sum  / brill_bins  : 0;
+    features.centroid  = (cent_den > 1e-6f) ? (cent_num / cent_den) / ((float)sr * 0.5f) : 0;
+    features.flux      = flux_sum / bins;
+
+    // Rolloff: częstotliwość poniżej której jest 85% energii
+    {
+        float target = total_energy * 0.85f;
+        float cumul  = 0;
+        features.rolloff = 1.0f;
+        for (int i = 1; i < bins; i++) {
+            cumul += magnitudes[i] / 255.0f;
+            if (cumul >= target) {
+                features.rolloff = (float)i / bins;
+                break;
+            }
+        }
+    }
+
+    // Spread: odchylenie standardowe od centroid
+    {
+        float mean_f = features.centroid * (float)sr * 0.5f;
+        float var    = 0;
+        float w_sum  = 0;
+        for (int i = 1; i < bins; i++) {
+            float f   = i * hz_per_bin;
+            float w   = magnitudes[i] / 255.0f;
+            float diff = f - mean_f;
+            var   += w * diff * diff;
+            w_sum += w;
+        }
+        float std_hz   = (w_sum > 1e-6f) ? sqrtf(var / w_sum) : 0;
+        features.spread = std_hz / ((float)sr * 0.5f);
+    }
+
+    // Wcześniejsze wyliczenie AGC, żeby użyć go do detekcji beatu
+    float agc = (global_max > 1e-4f) ? (1.0f / global_max) : 1.0f;
+
+    // Beat detection: flux spike + bass energy (SKALOWANE PRZEZ AGC!)
+    float flux_scaled = features.flux * agc;
+    float bass_scaled = features.bass * agc;
+    
+    if (flux_scaled > beat_threshold && bass_scaled > 0.15f) {
+        features.beat = 1;
+        float f_beat_str = (flux_scaled / beat_threshold * 128.0f);
+        features.beat_strength = (f_beat_str > 255.0f) ? 255 : (uint8_t)f_beat_str;
+        update_bpm(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    } else {
+        features.beat          = 0;
+        features.beat_strength = 0;
+    }
+
+    if (warmup_frames < 4) warmup_frames++;
+
+    // Poziomy uint8 dla LED - z zastosowaniem AGC (global_max), tak samo jak bands/mags
+    float f_bass   = features.bass     * agc * 255.0f;
+    float f_mid    = features.mid      * agc * 255.0f;
+    float f_treble = features.treble   * agc * 255.0f;
+    float f_energy = features.energy   * agc * 255.0f;
+    float f_pres   = features.presence * agc * 255.0f;
+
+    features.bass_level     = (f_bass   > 255.0f) ? 255 : (uint8_t)f_bass;
+    features.mid_level      = (f_mid    > 255.0f) ? 255 : (uint8_t)f_mid;
+    features.treble_level   = (f_treble > 255.0f) ? 255 : (uint8_t)f_treble;
+    features.energy_level   = (f_energy > 255.0f) ? 255 : (uint8_t)f_energy;
+    features.presence_level = (f_pres   > 255.0f) ? 255 : (uint8_t)f_pres;
+
+    features.centroid_level = (uint8_t)(features.centroid  * 255.0f); // centroid is 0-1 anyway
+    
+    float f_flux_lvl = features.flux * agc * 3.0f * 255.0f;
+    features.flux_level = (f_flux_lvl > 255.0f) ? 255 : (uint8_t)f_flux_lvl;
+}
+
+/* ================================================================
+ * PRZETWARZANIE: I2S → MAGNITUDY → BANDS → FEATURES
+ * ================================================================ */
+
+static void process_all(int n) {
+    int half = n >> 1;
+
+    // 1. Okno Hanna + konwersja int32 → float
+    //
+    // machine_i2s.c DMA layout (data_bit_width=32, stereo):
+    //   Each stereo frame = 8 bytes = 2 × int32_t:
+    //     i2s_raw[i*2  ] = LEFT  channel 32-bit slot  (INMP441 L/R=GND)
+    //     i2s_raw[i*2+1] = RIGHT channel 32-bit slot  (INMP441 L/R=VCC)
+    //
+    //   INMP441 24-bit audio is MSB-justified in the 32-bit word:
+    //     bits[31:8] = audio,  bits[7:0] = 0
+    //   Extract upper 16 bits (bits[31:16]) = most significant 16 bits of audio.
+    for (int i = 0; i < n; i++) {
+        int16_t sample = (int16_t)(i2s_raw[i * 2] >> 16);  // LEFT ch (L/R=GND)
+        float s = (float)sample / 32768.0f;
+        fft_re[i] = s * hann_window[i];
+        fft_im[i] = 0.0f;
+    }
+
+    // 2. FFT
+    fft_compute(n);
+
+    // 3. Magnitudy + peak decay + auto-gain → uint8
+    //
+    // POPRAWKA: global_max śledzony z surowych magnitudy (PRZED peak_decay)
+    //   Stara wersja: new_max = max(peak_values) → peak_values już po decay
+    // 3. Magnitude calculation + Per-bin decay + AGC
+    float frame_max_mag_raw = 0.0f;  
+    int   frame_bins_above  = 0;     
+    int   frame_max_sample  = 0;     
+
+    // Track max sample for diagnostics
+    for (int i = 0; i < n; i++) {
+        int16_t s = (int16_t)(i2s_raw[i * 2] >> 16);
+        int abs_s = (s < 0) ? -s : s;
+        if (abs_s > frame_max_sample) frame_max_sample = abs_s;
+    }
+
+    for (int i = 0; i < half; i++) {
+        float mag = sqrtf(fft_re[i]*fft_re[i] + fft_im[i]*fft_im[i]) / (float)half;
+        if (mag > frame_max_mag_raw) frame_max_mag_raw = mag;
+
+        // Peak decay logic (Attack is instant, decay uses peak_decay)
+        if (mag > peak_values[i]) peak_values[i] = mag;
+        else                       peak_values[i] *= peak_decay;
+        
+        // Per-bin noise gate
+        if (peak_values[i] < noise_gate) peak_values[i] = 0;
+        else frame_bins_above++;
+    }
+
+    // 4. AGC update (Global Max Tracking)
+    global_max *= global_max_dec; 
+    if (frame_max_mag_raw > global_max) global_max = frame_max_mag_raw;
+    if (global_max < global_max_floor)  global_max = global_max_floor;
+
+    // 5. Final uint8 mapping with AGC
+    float agc = 1.0f / global_max;
+    for (int i = 0; i < half; i++) {
+        float v = (peak_values[i] * agc) * 255.0f;
+        magnitudes[i] = (v > 255.0f) ? 255 : (uint8_t)v;
+    }
+    magnitudes[0] = 0; // DC kill
+
+    // Update diagnostics
+    diag_max_mag_raw    = frame_max_mag_raw;
+    diag_bins_above     = frame_bins_above;
+    diag_max_sample     = frame_max_sample;
+    diag_noise_gate_val = noise_gate;
+
+    // 4. Pasma
+    compute_bands(n, sample_rate);
+
+    // 5. Cechy spektralne + beat
+    compute_features(n, sample_rate);
+}
+
+/* ================================================================
+ * I2S INIT — INMP441
+ * ================================================================ */
+
+static esp_err_t i2s_init(int sck, int ws, int sd, int sr) {
+    if (rx_chan) {
+        i2s_channel_disable(rx_chan);
+        i2s_del_channel(rx_chan);
+        rx_chan = NULL;
+    }
+
+    // ── Channel config — match machine_i2s.c exactly ──
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num  = 6;   // machine_i2s.c default (was 4)
+    chan_cfg.dma_frame_num = 256; // machine_i2s.c DMA_BUF_LEN_IN_I2S_FRAMES
+                                  // OLD: 512 → 512*8=4096 bytes > ESP-IDF 4092-byte limit!
+    chan_cfg.auto_clear_after_cb = true;  // machine_i2s.c sets auto_clear=true
+
+    esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_new_channel FAILED: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // ── Slot config — match machine_i2s.c RX mode ──
+    // RX always: data_bit_width=32, slot_mode=STEREO (even for mono mics)
+    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+        I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
+    slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(sr),
+        .slot_cfg = slot_cfg,
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = sck,
+            .ws   = ws,
+            .dout = I2S_GPIO_UNUSED,
+            .din  = sd,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false }
+        },
+    };
+
+    err = i2s_channel_init_std_mode(rx_chan, &std_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_init_std_mode FAILED: %s", esp_err_to_name(err));
+        i2s_del_channel(rx_chan);
+        rx_chan = NULL;
+        return err;
+    }
+
+    err = i2s_channel_enable(rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_enable FAILED: %s", esp_err_to_name(err));
+        i2s_del_channel(rx_chan);
+        rx_chan = NULL;
+        return err;
+    }
+
+    ESP_LOGI(TAG, "I2S OK sck=%d ws=%d sd=%d sr=%d dma_frames=%d dma_desc=%d",
+             sck, ws, sd, sr, 256, 6);
+    return ESP_OK;
+}
+
+/* ================================================================
+ * ZADANIE NA RDZENIU 0
+ * ================================================================ */
+
+static volatile int diag_frame_count = 0;  // diagnostic counter
+
+static void fft_core1_task(void *arg) {
+    size_t bytes_read;
+    ESP_LOGI(TAG, "task running on core %d", xPortGetCoreID());
+
+    while (fft_task_running) {
+        int n = fft_size;
+        // data_bit_width=32, stereo: 1 frame = 2 × int32_t = 8 bytes.
+        // Request n stereo frames → n × 2 × sizeof(int32_t) bytes.
+        size_t want = n * 2 * sizeof(int32_t);
+        esp_err_t err = i2s_channel_read(
+            rx_chan, i2s_raw, want,
+            &bytes_read, pdMS_TO_TICKS(I2S_TIMEOUT_MS));
+
+        if (err != ESP_OK || bytes_read == 0) {
+            // Log first few failures for diagnostics
+            if (diag_frame_count < 5) {
+                ESP_LOGW(TAG, "i2s_channel_read: err=%s bytes=%u/%u",
+                         esp_err_to_name(err), (unsigned)bytes_read, (unsigned)want);
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        // Log first successful read with raw data sample
+        if (diag_frame_count < 3) {
+            ESP_LOGI(TAG, "read OK: %u/%u bytes, raw[0..5]=%08lx %08lx %08lx %08lx %08lx %08lx",
+                     (unsigned)bytes_read, (unsigned)want,
+                     (long)i2s_raw[0], (long)i2s_raw[1],
+                     (long)i2s_raw[2], (long)i2s_raw[3],
+                     (long)i2s_raw[4], (long)i2s_raw[5]);
+        }
+        diag_frame_count++;
+
+        if (xSemaphoreTake(cfg_mutex, 0) == pdTRUE) {
+            process_all(n);
+            fft_ready = 1;
+            xSemaphoreGive(cfg_mutex);
+        }
+    }
+    fft_task_h = NULL;
+    vTaskDelete(NULL);
+}
+
+/* ================================================================
+ * BUFFER OBJECTS (memoryview support, kompatybilne z v1.28.0)
+ * ================================================================ */
+
+// --- magnitudes buffer ---
+static mp_int_t mag_get_buf(mp_obj_t s, mp_buffer_info_t *b, mp_uint_t f) {
+    b->buf = (void *)magnitudes;
+    b->len = fft_size / 2; 
+    b->typecode = 'B'; 
+    return 0;
+}
+MP_DEFINE_CONST_OBJ_TYPE(mag_buf_type, MP_QSTR_MagBuf, MP_TYPE_FLAG_NONE, buffer, mag_get_buf);
+static const mp_obj_base_t mag_buf_obj = { &mag_buf_type };
+
+// --- bands buffer ---
+static mp_int_t band_get_buf(mp_obj_t s, mp_buffer_info_t *b, mp_uint_t f) {
+    b->buf = (void *)band_values;
+    b->len = num_bands; 
+    b->typecode = 'B'; 
+    return 0;
+}
+MP_DEFINE_CONST_OBJ_TYPE(band_buf_type, MP_QSTR_BandBuf, MP_TYPE_FLAG_NONE, buffer, band_get_buf);
+static const mp_obj_base_t band_buf_obj = { &band_buf_type };
+
+// --- features buffer ---
+static mp_int_t feat_get_buf(mp_obj_t s, mp_buffer_info_t *b, mp_uint_t f) {
+    b->buf = (void *)&features;
+    b->len = sizeof(fft_features_t); 
+    b->typecode = 'B'; 
+    return 0;
+}
+MP_DEFINE_CONST_OBJ_TYPE(feat_buf_type, MP_QSTR_FeatBuf, MP_TYPE_FLAG_NONE, buffer, feat_get_buf);
+static const mp_obj_base_t feat_buf_obj = { &feat_buf_type };
+
+/* ================================================================
+ * PYTHON API BINDINGS
+ * ================================================================ */
+
+static mp_obj_t py_stop(void);
+
+static mp_obj_t py_start(size_t n_args, const mp_obj_t *args) {
+    // Auto-cleanup po soft reboot — zmienne C przeżywają restart Pythona
+    py_stop();
+    fft_ready = 0;
+    diag_frame_count = 0;
+
+    int sck = mp_obj_get_int(args[0]);
+    int ws  = mp_obj_get_int(args[1]);
+    int sd  = mp_obj_get_int(args[2]);
+    int sr  = (n_args >= 4) ? mp_obj_get_int(args[3]) : 44100;
+    
+    sample_rate = sr;
+    cfg_mutex = xSemaphoreCreateMutex();
+
+    hann_init(fft_size);
+    memset(magnitudes,        0, sizeof(magnitudes));
+    memset(band_values,       0, sizeof(band_values));
+    memset(peak_values,       0, sizeof(peak_values));
+    memset(prev_magnitudes_f, 0, sizeof(prev_magnitudes_f));
+    memset(&features,         0, sizeof(features));
+    
+    global_max    = 0.0f;
+    raw_max       = 0.0f;
+    warmup_frames = 0;
+    beat_idx = 0;
+    beat_count = 0;
+
+    if (i2s_init(sck, ws, sd, sr) != ESP_OK) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("I2S init failed"));
+    }
+
+    /* Use xTaskCreatePinnedToCore only when FreeRTOS SMP is available.
+     * In IDF v5.3 this macro is guarded by CONFIG_FREERTOS_SMP; fall back to
+     * xTaskCreate (core 0 is default on single-core scheduler) otherwise. */
+    /* Moving task to Core 1 to avoid interference with MicroPython/WiFi on Core 0 */
+    fft_task_running = true;
+#if defined(CONFIG_FREERTOS_SMP) && (portNUM_PROCESSORS > 1)
+    xTaskCreatePinnedToCore(fft_core1_task, "fft_c1", 8192, NULL, 5, &fft_task_h, 1);
+#else
+    xTaskCreate(fft_core1_task, "fft_c1", 8192, NULL, 5, &fft_task_h);
+#endif
+
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(py_start_obj, 3, 4, py_start);
+
+static mp_obj_t py_stop(void) {
+    if (fft_task_h) {
+        fft_task_running = false;
+        while (fft_task_h != NULL) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    if (rx_chan) {
+        i2s_channel_disable(rx_chan);
+        i2s_del_channel(rx_chan);
+        rx_chan = NULL;
+    }
+    if (cfg_mutex) {
+        vSemaphoreDelete(cfg_mutex);
+        cfg_mutex = NULL;
+    }
+    fft_ready = 0;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(py_stop_obj, py_stop);
+
+static mp_obj_t py_configure(size_t n_args, const mp_obj_t *args) {
+    int new_size = mp_obj_get_int(args[0]);
+    if (new_size < 64 || new_size > FFT_MAX_SIZE || (new_size & (new_size-1))) {
+        mp_raise_ValueError(MP_ERROR_TEXT("fft_size must be power of 2 between 64 and 1024"));
+    }
+
+    int new_bands = (n_args >= 2) ? mp_obj_get_int(args[1]) : num_bands;
+    if (new_bands < 1 || new_bands > MAX_BANDS) {
+        mp_raise_ValueError(MP_ERROR_TEXT("bands must be 1-24"));
+    }
+
+    if (n_args >= 3) peak_decay       = mp_obj_get_float(args[2]);
+    if (n_args >= 4) global_max_dec   = mp_obj_get_float(args[3]);
+    if (n_args >= 5) beat_threshold   = mp_obj_get_float(args[4]);
+    if (n_args >= 6) global_max_floor = mp_obj_get_float(args[5]);
+    if (n_args >= 7) noise_gate       = mp_obj_get_float(args[6]);
+
+    if (cfg_mutex) xSemaphoreTake(cfg_mutex, portMAX_DELAY);
+
+    fft_size  = new_size;
+    num_bands = new_bands;
+    hann_init(new_size);
+
+    memset(magnitudes,        0, sizeof(magnitudes));
+    memset(band_values,       0, sizeof(band_values));
+    memset(peak_values,       0, sizeof(peak_values));
+    memset(prev_magnitudes_f, 0, sizeof(prev_magnitudes_f));
+    memset(&features,         0, sizeof(features));
+    
+    global_max    = 0.0f;
+    raw_max       = 0.0f;
+    warmup_frames = 0;
+    beat_idx = 0;
+    beat_count = 0;
+    fft_ready  = 0;
+
+    if (cfg_mutex) xSemaphoreGive(cfg_mutex);
+
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(py_configure_obj, 1, 7, py_configure);
+
+static mp_obj_t py_ready(void) {
+    return mp_obj_new_bool(fft_ready);
+}
+static mp_obj_t py_clear_ready(void) {
+    fft_ready = 0;
+    return mp_const_none;
+}
+
+static mp_obj_t py_mag_buffer(void)  { return MP_OBJ_FROM_PTR(&mag_buf_obj); }
+static mp_obj_t py_band_buffer(void) { return MP_OBJ_FROM_PTR(&band_buf_obj); }
+static mp_obj_t py_feat_buffer(void) { return MP_OBJ_FROM_PTR(&feat_buf_obj); }
+
+static MP_DEFINE_CONST_FUN_OBJ_0(py_ready_obj,       py_ready);
+static MP_DEFINE_CONST_FUN_OBJ_0(py_clear_ready_obj, py_clear_ready);
+static MP_DEFINE_CONST_FUN_OBJ_0(py_mag_buffer_obj,  py_mag_buffer);
+static MP_DEFINE_CONST_FUN_OBJ_0(py_band_buffer_obj, py_band_buffer);
+static MP_DEFINE_CONST_FUN_OBJ_0(py_feat_buffer_obj, py_feat_buffer);
+
+static mp_obj_t py_info(void) {
+    mp_obj_t d = mp_obj_new_dict(8);
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_fft_size),   mp_obj_new_int(fft_size));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_bands),      mp_obj_new_int(num_bands));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_bins),       mp_obj_new_int(fft_size/2));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_bpm),        mp_obj_new_int(features.bpm_est));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_beat),       mp_obj_new_bool(features.beat));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_energy),     mp_obj_new_float(features.energy));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_global_max),      mp_obj_new_float(global_max));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_raw_max),         mp_obj_new_float(raw_max));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_global_max_floor),mp_obj_new_float(global_max_floor));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_core),            mp_obj_new_int(1));
+    // Diagnostics
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_max_mag_raw),     mp_obj_new_float(diag_max_mag_raw));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_bins_above_gate), mp_obj_new_int(diag_bins_above));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_max_sample),      mp_obj_new_int(diag_max_sample));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_noise_gate),      mp_obj_new_float(diag_noise_gate_val));
+    return d;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(py_info_obj, py_info);
+
+/* raw_debug() — print first 16 raw I2S int32 values + extracted int16 samples */
+static mp_obj_t py_raw_debug(void) {
+    mp_obj_t lst = mp_obj_new_list(0, NULL);
+    for (int i = 0; i < 8; i++) {
+        // Each stereo frame: [word0, word1]
+        int32_t w0 = i2s_raw[i * 2];      // first word (LEFT in standard I2S)
+        int32_t w1 = i2s_raw[i * 2 + 1];  // second word (RIGHT in standard I2S)
+        int16_t s0 = (int16_t)(w0 >> 16);  // upper 16 bits of word0
+        int16_t s1 = (int16_t)(w1 >> 16);  // upper 16 bits of word1
+
+        mp_obj_t frame[4] = {
+            mp_obj_new_int(w0),
+            mp_obj_new_int(w1),
+            mp_obj_new_int(s0),
+            mp_obj_new_int(s1),
+        };
+        mp_obj_list_append(lst, mp_obj_new_tuple(4, frame));
+    }
+    return lst;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(py_raw_debug_obj, py_raw_debug);
+
+/* ================================================================
+ * MODULE GLOBALS
+ * ================================================================ */
+
+static const mp_rom_map_elem_t fft_globals[] = {
+    { MP_ROM_QSTR(MP_QSTR___name__),      MP_ROM_QSTR(MP_QSTR_fft_core1)    },
+    
+    // Funkcje
+    { MP_ROM_QSTR(MP_QSTR_start),         MP_ROM_PTR(&py_start_obj)         },
+    { MP_ROM_QSTR(MP_QSTR_stop),          MP_ROM_PTR(&py_stop_obj)          },
+    { MP_ROM_QSTR(MP_QSTR_configure),     MP_ROM_PTR(&py_configure_obj)     },
+    { MP_ROM_QSTR(MP_QSTR_ready),         MP_ROM_PTR(&py_ready_obj)         },
+    { MP_ROM_QSTR(MP_QSTR_clear_ready),   MP_ROM_PTR(&py_clear_ready_obj)   },
+    
+    // Bufory zero-alokacyjne
+    { MP_ROM_QSTR(MP_QSTR_magnitudes),    MP_ROM_PTR(&py_mag_buffer_obj)    },
+    { MP_ROM_QSTR(MP_QSTR_bands),         MP_ROM_PTR(&py_band_buffer_obj)   },
+    { MP_ROM_QSTR(MP_QSTR_features),      MP_ROM_PTR(&py_feat_buffer_obj)   },
+    { MP_ROM_QSTR(MP_QSTR_info),          MP_ROM_PTR(&py_info_obj)          },
+    { MP_ROM_QSTR(MP_QSTR_raw_debug),     MP_ROM_PTR(&py_raw_debug_obj)     },
+
+    // Offsety w buforze features (do struct.unpack_from)
+    { MP_ROM_QSTR(MP_QSTR_OFF_ENERGY),    MP_ROM_INT(0)  },
+    { MP_ROM_QSTR(MP_QSTR_OFF_BASS),      MP_ROM_INT(4)  },
+    { MP_ROM_QSTR(MP_QSTR_OFF_MID),       MP_ROM_INT(8)  },
+    { MP_ROM_QSTR(MP_QSTR_OFF_TREBLE),    MP_ROM_INT(12) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_PRESENCE),  MP_ROM_INT(16) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_CENTROID),  MP_ROM_INT(24) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_FLUX),      MP_ROM_INT(28) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_BEAT),      MP_ROM_INT(44) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_BPM),       MP_ROM_INT(46) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_BASS_L),    MP_ROM_INT(48) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_MID_L),     MP_ROM_INT(49) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_TREBLE_L),  MP_ROM_INT(50) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_ENERGY_L),    MP_ROM_INT(51) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_PRESENCE_L),  MP_ROM_INT(52) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_CENTROID_L),  MP_ROM_INT(53) },
+    { MP_ROM_QSTR(MP_QSTR_OFF_FLUX_L),      MP_ROM_INT(54) },
+    // Auto-gain diagnostyka
+    { MP_ROM_QSTR(MP_QSTR_OFF_BEAT_STR),    MP_ROM_INT(45) },
+};
+static MP_DEFINE_CONST_DICT(fft_globals_dict, fft_globals);
+
+const mp_obj_module_t fft_core1_module = {
+    .base    = { &mp_type_module },
+    .globals = (mp_obj_dict_t *)&fft_globals_dict,
+};
+MP_REGISTER_MODULE(MP_QSTR_fft_core1, fft_core1_module);
