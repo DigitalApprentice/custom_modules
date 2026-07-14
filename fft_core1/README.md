@@ -170,7 +170,7 @@ fft_core1.start(4, 5, 6, 44100)
 # 2. Configure runtime parameters
 # FFT size: 256 samples, Bands: 12 bands
 # Other parameters left at their optimal defaults
-fft_core1.configure(256, 12)
+fft_core1.configure(size=256, bands=12, decay=0.92, agc_dec=0.99, beat_thr=0.25, agc_floor=0.001, gate=0.001)
 
 # 3. Create references to zero-allocation buffers
 # Calling these once binds to the memory directly — no allocation inside the loop!
