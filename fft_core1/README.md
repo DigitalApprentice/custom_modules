@@ -1,6 +1,6 @@
 # fft_core1 — MicroPython Custom C Module for ESP32-S3
 
-A high-performance, real-time audio FFT processor for **ESP32-S3** written as a MicroPython custom C module (compatible with **ESP-IDF v5.4** and **MicroPython v1.28.0**). 
+A high-performance, real-time audio FFT processor for **ESP32-S3** written as a MicroPython custom C module (compatible with **ESP-IDF v5.32** and **MicroPython v1.28.0**). 
 
 It is designed to run asynchronously on **Core 1** to prevent interference with MicroPython execution or Wi-Fi operations on Core 0. It captures stereo I2S audio (specifically tested with the **INMP441** MEMS microphone), performs Hanning windowing and a Radix-2 FFT, groups magnitudes into configurable logarithmic bands, estimates BPM, and extracts complex spectral features.
 
