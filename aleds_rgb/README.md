@@ -50,7 +50,7 @@ AledsRgb(pin, buffer, n, bpp=3, order=ORDER_RGB, timing=TIMING_800KHZ, led_type=
   * `pin` (`int` or `machine.Pin`): The GPIO pin used to drive the LEDs.
   * `buffer` (`bytearray` or compatible buffer): A buffer of at least `n * bpp` bytes.
   * `n` (`int`): The total number of pixels on the strip.
-  * `bpp` (`int`, optional, default `3`): Bytes per pixel (e.g., 3 for RGB, 4 for RGBW).
+  * `bpp` (`int`, optional, default `3`): Bytes per pixel (e.g., 3 for RGB, 4 for RGBW but not supported in this version, it's only RGB).
   * `order` (`tuple`, optional, default `ORDER_RGB`): The color component sequence in the physical buffer.
   * `timing` (`tuple`, optional, default `TIMING_800KHZ`): Bitstream timing tuple.
   * `led_type` (`str`, optional, default `'ws2812'`): Target LED chip architecture.
